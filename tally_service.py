@@ -297,9 +297,9 @@ def get_open_companies():
 
 def get_tally_company_info():
 
-    """Read the open company's name and state from Tally.
+    """Read the open company's identity and primary address from Tally.
 
-    Returns {"name": str, "state": str} or None if the company can't be read.
+    Returns name/state/address/pincode or None if the company can't be read.
     """
 
     xml = f"""<ENVELOPE>
@@ -319,6 +319,8 @@ def get_tally_company_info():
 <FETCH>NAME</FETCH>
 <FETCH>STATENAME</FETCH>
 <FETCH>PRIORSTATENAME</FETCH>
+<FETCH>ADDRESS</FETCH>
+<FETCH>PINCODE</FETCH>
 </FETCHLIST>
 </DESC>
 </BODY>
@@ -355,11 +357,22 @@ def get_tally_company_info():
         or company.findtext("PRIORSTATENAME")
         or ""
     )
+    address = [
+        _clean_tally_text(node.text)
+        for node in company.findall(".//ADDRESS.LIST/ADDRESS")
+        if _clean_tally_text(node.text)
+    ]
+    pincode = _clean_tally_text(company.findtext("PINCODE") or "")
 
     if not name:
         return None
 
-    return {"name": name, "state": state}
+    return {
+        "name": name,
+        "state": state,
+        "address": address,
+        "pincode": pincode,
+    }
 
 
 def _sanitize_tally_xml(text):
@@ -781,6 +794,33 @@ def find_tally_stock_by_part_no(part_no):
                 stock["part_no"] = code
                 return stock
 
+    return None
+
+
+def find_tally_stock_by_name(stock_name):
+
+    """Look up ONE stock item by exact Name. Safe filtered export."""
+
+    name = str(stock_name or "").strip()
+    if not name:
+        return None
+
+    name_xml = escape(name)
+    want = name.strip().lower()
+    try:
+        stocks = _export_filtered_stock(
+            f'$$IsEqual:$Name:"{name_xml}"',
+            collection_id="StockByName",
+        )
+    except (requests.RequestException, ET.ParseError):
+        return None
+
+    for stock in stocks:
+        if str(stock.get("name") or "").strip().lower() == want:
+            return stock
+        # Filter already matched; accept first hit
+        if stock.get("name"):
+            return stock
     return None
 
 
@@ -1975,8 +2015,18 @@ def create_sales_voucher(
 <CMPGSTREGISTRATIONTYPE>Regular</CMPGSTREGISTRATIONTYPE>
 <GSTREGISTRATION>{company_gstin}</GSTREGISTRATION>"""
 
-    consignee_name = escape(str(invoice_meta.get("consignee") or ""))
-    consignee_gstin = escape(str(invoice_meta.get("shipping_gstin") or "").strip())
+    consignee_raw_name = str(
+        invoice_meta.get("consignee")
+        or bill_to.get("name")
+        or ""
+    ).strip()
+    consignee_name = escape(consignee_raw_name)
+    consignee_raw_gstin = str(
+        invoice_meta.get("shipping_gstin")
+        or bill_to.get("gstin")
+        or ""
+    ).strip()
+    consignee_gstin = escape(consignee_raw_gstin)
     ship_to = {
         "street": invoice_meta.get("shipping_street"),
         "city": invoice_meta.get("shipping_city"),
@@ -2053,6 +2103,68 @@ def create_sales_voucher(
     if consignee_gstin:
         consignee_tags += f"<CONSIGNEEGSTIN>{consignee_gstin}</CONSIGNEEGSTIN>\n"
 
+    # Default e-Way Bill classification for generated sales invoices.
+    eway_bill_tags = ""
+    if TALLY_ENABLE_GST:
+        # Sub Type and Document Type belong to Tally's EWayBillDetails
+        # aggregate. Once this aggregate exists, Tally no longer derives its
+        # consignor/consignee address fields from the voucher automatically,
+        # so include the identity, address type, PIN and state here too.
+        company_info = get_tally_company_info() or {}
+        consignor_name = escape(
+            str(company_info.get("name") or TALLY_COMPANY_NAME).strip()
+        )
+        consignor_pincode = escape(
+            _format_postal(company_info.get("pincode"))
+        )
+        consignor_state = escape(
+            str(company_info.get("state") or TALLY_COMPANY_STATE).strip()
+        )
+        consignor_gstin = escape(str(TALLY_COMPANY_GSTIN or "").strip())
+
+        eway_consignee_name = escape(
+            consignee_raw_name or str(bill_to.get("name") or "").strip()
+        )
+        eway_consignee_gstin = escape(
+            consignee_raw_gstin or str(bill_to.get("gstin") or "").strip()
+        )
+        eway_consignee_pincode = escape(
+            ship_postal or _format_postal(bill_to.get("postal"))
+        )
+        eway_consignee_state = escape(
+            ship_state or str(bill_to.get("state") or "").strip()
+        )
+        eway_consignee_place = escape(
+            ship_city or str(bill_to.get("city") or "").strip()
+        )
+
+        eway_bill_tags = """<EWAYBILLDETAILS.LIST>
+<SUBTYPE>Supply</SUBTYPE>
+<DOCUMENTTYPE>Tax Invoice</DOCUMENTTYPE>
+<CONSIGNORNAME>{consignor_name}</CONSIGNORNAME>
+<CONSIGNORGSTIN>{consignor_gstin}</CONSIGNORGSTIN>
+<CONSIGNORADDRESSTYPE>Primary</CONSIGNORADDRESSTYPE>
+<CONSIGNORPINCODE>{consignor_pincode}</CONSIGNORPINCODE>
+<CONSIGNORSTATENAME>{consignor_state}</CONSIGNORSTATENAME>
+<CONSIGNEENAME>{eway_consignee_name}</CONSIGNEENAME>
+<CONSIGNEEGSTIN>{eway_consignee_gstin}</CONSIGNEEGSTIN>
+<CONSIGNEEADDRESSTYPE>Primary</CONSIGNEEADDRESSTYPE>
+<CONSIGNEEPLACE>{eway_consignee_place}</CONSIGNEEPLACE>
+<CONSIGNEEPINCODE>{eway_consignee_pincode}</CONSIGNEEPINCODE>
+<CONSIGNEESTATENAME>{eway_consignee_state}</CONSIGNEESTATENAME>
+</EWAYBILLDETAILS.LIST>
+""".format(
+            consignor_name=consignor_name,
+            consignor_gstin=consignor_gstin,
+            consignor_pincode=consignor_pincode,
+            consignor_state=consignor_state,
+            eway_consignee_name=eway_consignee_name,
+            eway_consignee_gstin=eway_consignee_gstin,
+            eway_consignee_place=eway_consignee_place,
+            eway_consignee_pincode=eway_consignee_pincode,
+            eway_consignee_state=eway_consignee_state,
+        )
+
     party_ledger_block = _build_party_ledger_block(
         account_name,
         bill_name,
@@ -2079,6 +2191,7 @@ def create_sales_voucher(
 {consignee_tags}
 {dispatch_from_tags}
 {transport_tags}
+{eway_bill_tags}
 {party_ledger_block}
 {inventory_entries}
 {sales_ledger_entry}
@@ -2099,35 +2212,111 @@ def create_sales_voucher(
 
 
 # ==========================================
-# create stock item
+# create stock item / stock group
 # ==========================================
+
+def ensure_stock_group(group_name, parent=None):
+
+    """Ensure stock group exists.
+
+    parent=None → root group (product family).
+    parent set → subgroup under that parent (e.g. thickness under Lamination Sheet).
+    """
+
+    group_name = str(group_name or "").strip()
+    if not group_name:
+        raise ValueError("Stock group name is required")
+
+    name_xml = escape(group_name)
+    parent = str(parent or "").strip()
+
+    if parent:
+        parent_xml = escape(parent)
+        body = f"""<STOCKGROUP NAME="{name_xml}" ACTION="Alter">
+<NAME>{name_xml}</NAME>
+<PARENT>{parent_xml}</PARENT>
+<ISADDABLE>Yes</ISADDABLE>
+</STOCKGROUP>"""
+    else:
+        body = f"""<STOCKGROUP NAME="{name_xml}" ACTION="Alter">
+<NAME.LIST>
+<NAME>{name_xml}</NAME>
+</NAME.LIST>
+<ISADDABLE>Yes</ISADDABLE>
+</STOCKGROUP>"""
+
+    xml = f"""<ENVELOPE>
+<HEADER>
+<TALLYREQUEST>Import Data</TALLYREQUEST>
+</HEADER>
+<BODY>
+<IMPORTDATA>
+{_import_requestdesc("All Masters")}
+<REQUESTDATA>
+<TALLYMESSAGE>
+{body}
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA>
+</BODY>
+</ENVELOPE>"""
+    response = _tally_post(xml)
+    return response.text
+
 
 def create_stock_item(
         product_name,
         product_code,
-        opening_qty=100000,
+        parent=None,
+        opening_qty=0,
         godown_name=None,
         description=None,
         hsn_code=None):
 
-    opening_qty = max(int(float(opening_qty or 0)), 100000)
-    godown_name = escape(godown_name or TALLY_GODOWN_NAME)
-    product_name = escape(product_name)
-    product_code = escape(product_code or "")
+    """Create a Tally stock item master (Name, Part No, Under, HSN).
+
+    Opening qty defaults to 0 (master only). Part No = MAILINGNAME.
+    Uses ACTION=Alter (create if missing). GST company needs HSN details.
+    """
+
+    product_name = str(product_name or "").strip()
+    product_code = str(product_code or "").strip()
+    parent = str(parent or "").strip()
+    if not product_name:
+        raise ValueError("product_name is required")
+    if not product_code:
+        raise ValueError("product_code (Part No) is required")
+    if not parent:
+        raise ValueError("parent (Product Family / Under) is required")
+
+    name_xml = escape(product_name)
+    code_xml = escape(product_code)
+    parent_xml = escape(parent)
     description = escape(str(description or "").strip())
-    hsn_code = escape(str(hsn_code or TALLY_DEFAULT_HSN_CODE).strip())
+    hsn_code = escape(str(hsn_code or TALLY_DEFAULT_HSN_CODE).strip() or TALLY_DEFAULT_HSN_CODE)
+    unit = escape(TALLY_UNIT_NAME or "Nos")
 
-    description_xml = ""
-    if description:
-        description_xml = f"<DESCRIPTION>{description}</DESCRIPTION>"
+    qty_num = float(opening_qty or 0)
+    opening_xml = ""
+    batch_xml = ""
+    if qty_num > 0:
+        godown_name = escape(godown_name or TALLY_GODOWN_NAME)
+        qty_str = _tally_qty(qty_num)
+        opening_xml = f"""<OPENINGBALANCE>{qty_str} {unit}</OPENINGBALANCE>
+"""
+        batch_xml = f"""<BATCHALLOCATIONS.LIST>
+<GODOWNNAME>{godown_name}</GODOWNNAME>
+<BATCHNAME>{escape(TALLY_BATCH_NAME)}</BATCHNAME>
+<OPENINGBALANCE>{qty_str} {unit}</OPENINGBALANCE>
+</BATCHALLOCATIONS.LIST>
+"""
 
-    hsn_description_xml = (
-        f"<DESCRIPTION>{description}</DESCRIPTION>"
-        if description
-        else ""
-    )
+    description_xml = f"<DESCRIPTION>{description}</DESCRIPTION>" if description else ""
+    hsn_description_xml = f"<DESCRIPTION>{description}</DESCRIPTION>" if description else ""
 
-    gst_xml = f"""<GSTAPPLICABLE>&#4; Applicable</GSTAPPLICABLE>
+    gst_xml = ""
+    if TALLY_ENABLE_GST:
+        gst_xml = f"""<GSTAPPLICABLE>&#4; Applicable</GSTAPPLICABLE>
 <GSTTYPEOFSUPPLY>Goods</GSTTYPEOFSUPPLY>
 <HSNDETAILS.LIST>
 <APPLICABLEFROM>20240401</APPLICABLEFROM>
@@ -2137,58 +2326,35 @@ def create_stock_item(
 </HSNDETAILS.LIST>
 {_stock_gst_details_full_xml()}"""
 
-    xml = f"""
-    <ENVELOPE>
-    <HEADER>
-    <TALLYREQUEST>Import Data</TALLYREQUEST>
-    </HEADER>
-
-    <BODY>
-    <IMPORTDATA>
-
-    {_import_requestdesc("All Masters")}
-
-    <REQUESTDATA>
-
-        <TALLYMESSAGE>
-
-        <STOCKITEM NAME="{product_name}" ACTION="Alter">
-
-        <NAME>{product_name}</NAME>
-
-        <BASEUNITS>Nos</BASEUNITS>
-
-        <OPENINGBALANCE>{opening_qty} Nos</OPENINGBALANCE>
-
-        <OPENINGVALUE>{opening_qty}.00</OPENINGVALUE>
-
-        {description_xml}
-
-        {gst_xml}
-
-        <BATCHALLOCATIONS.LIST>
-        <GODOWNNAME>{godown_name}</GODOWNNAME>
-        <BATCHNAME>Primary Batch</BATCHNAME>
-        <OPENINGBALANCE>{opening_qty} Nos</OPENINGBALANCE>
-        </BATCHALLOCATIONS.LIST>
-
-        <NOTES>{product_code}</NOTES>
-
-        </STOCKITEM>
-
-        </TALLYMESSAGE>
-
-    </REQUESTDATA>
-
-    </IMPORTDATA>
-    </BODY>
-    </ENVELOPE>
-    """
+    xml = f"""<ENVELOPE>
+<HEADER>
+<TALLYREQUEST>Import Data</TALLYREQUEST>
+</HEADER>
+<BODY>
+<IMPORTDATA>
+{_import_requestdesc("All Masters")}
+<REQUESTDATA>
+<TALLYMESSAGE>
+<STOCKITEM NAME="{name_xml}" ACTION="Alter">
+<NAME>{name_xml}</NAME>
+<PARENT>{parent_xml}</PARENT>
+<MAILINGNAME.LIST TYPE="String">
+<MAILINGNAME>{code_xml}</MAILINGNAME>
+</MAILINGNAME.LIST>
+<BASEUNITS>{unit}</BASEUNITS>
+{description_xml}
+{gst_xml}
+{opening_xml}{batch_xml}</STOCKITEM>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA>
+</BODY>
+</ENVELOPE>"""
 
     response = _tally_post(xml)
 
     print("=" * 70)
-    print(f"Stock Item : {product_name}")
+    print(f"Stock Item create : {product_name} | Part No={product_code} | Under={parent}")
     print("=" * 70)
     print(response.text)
 

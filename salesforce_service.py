@@ -59,6 +59,10 @@ from config import (
     ORDER_MANAGE_PRODUCT_NAME_FIELD,
     PRODUCT_CODE_FIELD,
     PRODUCT_HSN_FIELD,
+    PRODUCT_OBJECT,
+    PRODUCT_FAMILY_FIELD,
+    PRODUCT_INFO_FIELD,
+    PRODUCT_LAMINATION_THICKNESS_FIELD,
     STOCK_PRODUCT_INFO_FIELD,
     STOCK_PRODUCT_LOOKUP_FIELD,
     STOCK_PRODUCT_NAME_FIELD,
@@ -79,8 +83,8 @@ def _token_endpoint():
     if SALESFORCE_AUTH_MODE == "client_credentials":
         if not SALESFORCE_MY_DOMAIN_TOKEN_URL:
             raise ValueError(
-                "Set SALESFORCE_MY_DOMAIN_TOKEN_URL in .env for External Client App. "
-                "Example: https://yourcompany.my.salesforce.com/services/oauth2/token"
+                "Set SALESFORCE_MY_DOMAIN_TOKEN_URL in config.py for External Client App. "
+                "Example: https://yourcompany--uatplus1.sandbox.my.salesforce.com/services/oauth2/token"
             )
         return SALESFORCE_MY_DOMAIN_TOKEN_URL
 
@@ -244,7 +248,7 @@ def update_opportunity(opportunity_id):
 # Get opportunity line items
 # ==========================================
 
-# Product_Family__c picklist values (Production Opportunity / Order Manage)
+# Product_Family__c picklist values (UATplus1 Opportunity / Order Manage)
 ORDER_MANAGE_PRODUCT_FAMILIES = (
     "Sarvesh PVC",
     "Cheran PVC",
@@ -499,26 +503,10 @@ def _order_manage_product_name(record, family, product):
 
 def _order_manage_product_info(record, family):
 
-    if _is_wall_panel_family(family):
-        panel_info = _wall_panel_display_name(record, family)
-        if panel_info:
-            return panel_info
-
-    product_info = record.get(ORDER_MANAGE_PRODUCT_INFO_FIELD) or ""
-
-    if product_info:
-        return product_info
-
-    if _is_lamination_family(family):
-        return _lamination_display_name(record)
-    if family in FOAM_SHEET_FAMILIES:
-        return _foam_sheet_display_name(record)
-    if family in FIXIT_FAMILIES:
-        return _fixit_display_name(record)
-    if _is_wall_panel_family(family):
-        return _wall_panel_display_name(record, family)
-
-    return ""
+    # Invoice description must be the raw Salesforce Product_Info__c value
+    # for every product family. Do not synthesize it from family-specific
+    # fields such as groove, colour, brand, grade, or thickness.
+    return str(record.get(ORDER_MANAGE_PRODUCT_INFO_FIELD) or "").strip()
 
 
 def _order_manage_query_fields():
@@ -749,12 +737,7 @@ def _enrich_dispatch_line_from_order_manage(
 def _format_stock_description(product_info, product_name):
 
     product_info = str(product_info or "").strip()
-    product_name = str(product_name or "").strip()
-
-    if product_info and product_name:
-        return f"{product_info} - {product_name}"
-
-    return product_info or product_name
+    return product_info
 
 
 def _resolve_product_hsn(product=None):
@@ -1251,3 +1234,49 @@ def get_dispatch_invoice_meta(dispatch):
         "destination": dispatch.get(DISPATCH_DESTINATION_FIELD),
         "freight": dispatch.get(DISPATCH_FREIGHT_FIELD),
     }
+
+
+def get_products_by_ids(product_ids):
+
+    """Fetch Product__c rows by Id (one or many)."""
+
+    ids = []
+    seen = set()
+    for raw in product_ids or []:
+        pid = str(raw or "").strip()
+        if pid and pid not in seen:
+            seen.add(pid)
+            ids.append(pid)
+
+    if not ids:
+        return []
+
+    escaped = []
+    for pid in ids:
+        escaped.append("'" + pid.replace("\\", "\\\\").replace("'", "\\'") + "'")
+
+    query = f"""
+    SELECT Id,
+           Name,
+           {PRODUCT_CODE_FIELD},
+           {PRODUCT_FAMILY_FIELD},
+           {PRODUCT_INFO_FIELD},
+           {PRODUCT_HSN_FIELD},
+           {PRODUCT_LAMINATION_THICKNESS_FIELD}
+    FROM {PRODUCT_OBJECT}
+    WHERE Id IN ({', '.join(escaped)})
+    """
+    rows = _run_query(query)
+    products = []
+    for row in rows:
+        products.append({
+            "id": row.get("Id"),
+            "name": str(row.get("Name") or "").strip(),
+            "code": str(row.get(PRODUCT_CODE_FIELD) or "").strip(),
+            "family": str(row.get(PRODUCT_FAMILY_FIELD) or "").strip(),
+            "product_info": str(row.get(PRODUCT_INFO_FIELD) or "").strip(),
+            "hsn": str(row.get(PRODUCT_HSN_FIELD) or "").strip(),
+            "thickness": str(row.get(PRODUCT_LAMINATION_THICKNESS_FIELD) or "").strip(),
+        })
+    return products
+

@@ -27,6 +27,7 @@ from salesforce_service import (
 )
 from stock_sync_service import sync_tally_stock_to_salesforce
 from outstanding_service import get_account_outstanding
+from product_sync_service import sync_products_to_tally
 from tally_diagnostics import parse_tally_response, read_tally_imp_tail
 from tally_service import (
     balance_line_item_amounts,
@@ -63,6 +64,15 @@ class StockSyncRequest(BaseModel):
             "Example: [\"3MMSER114\"]. Omit or null to sync all Stock__c rows."
         ),
         examples=[["3MMSER114", "1MMSER107"]],
+    )
+
+
+class ProductSyncRequest(BaseModel):
+    product_id: str = Field(
+        ...,
+        description="Salesforce Product__c Id to create in Tally (single record only).",
+        examples=["a0Xfw000000XXXX"],
+        min_length=1,
     )
 
 
@@ -363,6 +373,48 @@ def account_outstanding_endpoint(account_id: str):
         return {
             "success": False,
             "message": str(e),
+        }
+
+
+@app.post("/sync-products-to-tally")
+def sync_products_to_tally_endpoint(payload: ProductSyncRequest):
+
+    """Create one missing Tally stock item from a Salesforce Product__c Id.
+
+    Body: { "product_id": "a0X..." }
+
+    Mapping:
+      Product_Info__c → "{Product Family} - {Product Info}"
+      Product_Code__c → Part No
+      Product_Family__c → root stock group
+      HSN_Code__c → HSN/SAC
+
+    Lamination Sheet only:
+      Lamination Sheet (root) → thickness group (1MM/2.5MM/3MM) → stock item
+
+    If Product Code already exists in Tally → error, not created.
+    """
+
+    connection = check_tally_connection()
+    if not connection.get("ok"):
+        return {
+            "success": False,
+            "message": connection.get("message")
+            or "Tally company/state check failed. Product sync blocked.",
+            "created": [],
+            "skipped": [],
+            "errors": [],
+        }
+
+    try:
+        return sync_products_to_tally(payload.product_id)
+    except Exception as e:
+        return {
+            "success": False,
+            "message": str(e),
+            "created": [],
+            "skipped": [],
+            "errors": [{"reason": str(e)}],
         }
 
 
