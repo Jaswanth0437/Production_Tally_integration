@@ -63,6 +63,9 @@ from config import (
     PRODUCT_FAMILY_FIELD,
     PRODUCT_INFO_FIELD,
     PRODUCT_LAMINATION_THICKNESS_FIELD,
+    QUOTE_DISCOUNT_FIELD,
+    QUOTE_OBJECT,
+    QUOTE_OPPORTUNITY_FIELD,
     STOCK_PRODUCT_INFO_FIELD,
     STOCK_PRODUCT_LOOKUP_FIELD,
     STOCK_PRODUCT_NAME_FIELD,
@@ -962,6 +965,36 @@ def get_dispatch_party_name(dispatch):
 def get_dispatch_voucher_type(dispatch):
 
     return str((dispatch or {}).get(DISPATCH_VOUCHER_TYPE_FIELD) or "").strip()
+
+
+def get_dispatch_discount_percent(dispatch):
+
+    opportunity_id = (dispatch or {}).get(DISPATCH_OPPORTUNITY_FIELD)
+    if not opportunity_id:
+        return 0.0
+
+    query = f"""
+    SELECT {QUOTE_DISCOUNT_FIELD}
+    FROM {QUOTE_OBJECT}
+    WHERE {QUOTE_OPPORTUNITY_FIELD} = '{opportunity_id}'
+    ORDER BY CreatedDate DESC
+    LIMIT 1
+    """
+
+    try:
+        records = _run_query(query)
+    except ValueError:
+        return 0.0
+
+    if not records:
+        return 0.0
+
+    value = records[0].get(QUOTE_DISCOUNT_FIELD)
+
+    try:
+        return float(value) if value not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _dispatch_select_fields():

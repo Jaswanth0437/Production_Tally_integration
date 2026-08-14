@@ -13,6 +13,7 @@ from salesforce_service import (
     get_access_token,
     get_dispatch,
     get_dispatch_bill_to,
+    get_dispatch_discount_percent,
     get_dispatch_invoice_meta,
     get_dispatch_line_items,
     get_dispatch_party_name,
@@ -129,6 +130,7 @@ def _create_tally_billing(
     update_callback=None,
     voucher_type=None,
     created_by=None,
+    discount_percent=0,
 ):
 
     print("\n" + "=" * 70)
@@ -140,6 +142,8 @@ def _create_tally_billing(
     print(f"Voucher Type : {voucher_type}")
     if created_by:
         print(f"Created By  : {created_by}")
+    if discount_percent:
+        print(f"Discount  : {discount_percent}%")
     print("=" * 70)
 
     connection = check_tally_connection()
@@ -216,6 +220,7 @@ def _create_tally_billing(
         bill_to=bill_to,
         voucher_type=voucher_type,
         created_by=created_by,
+        discount_percent=discount_percent,
     )
 
     print("\nVoucher Response")
@@ -300,12 +305,16 @@ def _create_tally_billing(
     }
 
 
-@app.get("/")
-def home():
+# @app.get("/")
+# def home():
 
-    return {
-        "status": "running"
-    }
+#     return {
+#         "status": "running"
+#     }
+
+@app.api_route("/", methods=["GET", "HEAD"])
+async def home():
+    return {"status": "running"}
 
 
 @app.get("/test-salesforce-auth")
@@ -557,6 +566,7 @@ def create_dispatch_invoice(
             }
 
         line_items = get_dispatch_line_items(dispatch["Id"], dispatch)
+        discount_percent = get_dispatch_discount_percent(dispatch)
 
         if not line_items:
             return {
@@ -627,6 +637,7 @@ def create_dispatch_invoice(
             update_callback=update_callback,
             voucher_type=voucher_type,
             created_by=resolved_created_by,
+            discount_percent=discount_percent,
         )
     except Exception as e:
         return {

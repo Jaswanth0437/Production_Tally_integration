@@ -580,6 +580,13 @@ def _tally_amount(value):
     return f"{float(value):.2f}"
 
 
+def _tally_discount_tag(item):
+    discount_percent = item.get("discount_percent")
+    if not discount_percent:
+        return ""
+    return f"<DISCOUNT>{float(discount_percent):.2f}%</DISCOUNT>\n"
+
+
 def to_tally_voucher_date(date_value=None):
     """Convert YYYY-MM-DD to YYYYMMDD. Tally EDU allows 1st, 2nd, last day only."""
     from datetime import datetime
@@ -634,6 +641,26 @@ def _normalize_line_item(line_item):
             normalized[key] = value
 
     return normalized
+
+
+def _apply_discount_to_line_items(line_items, discount_percent):
+
+    discount_percent = float(discount_percent or 0)
+    if not discount_percent:
+        return line_items
+
+    discounted = []
+    for item in line_items:
+        item = {**item}
+        quantity = float(item.get("quantity") or 0)
+        unit_price = float(item.get("unit_price") or 0)
+        item["total_price"] = round(
+            quantity * unit_price * (1 - discount_percent / 100), 2
+        )
+        item["discount_percent"] = discount_percent
+        discounted.append(item)
+
+    return discounted
 
 
 def _item_hsn(item):
@@ -1230,6 +1257,7 @@ def _build_line_inventory_xml(
     description_tags = _inventory_description_tags(item)
     amount = _tally_amount(item["total_price"])
     qty = _tally_qty(item["quantity"])
+    discount_tag = _tally_discount_tag(item)
     # Stock items track location (Ignore Godowns = No) — godown is required on batch lines.
     # Use config default / optional dispatch godown; do not create godowns here.
     godown = escape(str(godown_name or TALLY_GODOWN_NAME).strip() or TALLY_GODOWN_NAME)
@@ -1252,7 +1280,7 @@ def _build_line_inventory_xml(
 <STOCKITEMNAME>{stock_name}</STOCKITEMNAME>
 <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
 {description_tags}<RATE>{_tally_rate(item["unit_price"])}</RATE>
-<AMOUNT>{amount}</AMOUNT>
+{discount_tag}<AMOUNT>{amount}</AMOUNT>
 <ACTUALQTY>{qty}</ACTUALQTY>
 <BILLEDQTY>{qty}</BILLEDQTY>
 {hsn_tags}{gst_tags}{batch_block}
@@ -1264,7 +1292,7 @@ def _build_line_inventory_xml(
 <STOCKITEMNAME>{stock_name}</STOCKITEMNAME>
 <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
 {description_tags}<RATE>{_tally_rate(item["unit_price"])}</RATE>
-<AMOUNT>{amount}</AMOUNT>
+{discount_tag}<AMOUNT>{amount}</AMOUNT>
 <ACTUALQTY>{qty}</ACTUALQTY>
 <BILLEDQTY>{qty}</BILLEDQTY>
 {hsn_tags}{gst_tags}{batch_block}
@@ -1815,6 +1843,7 @@ def create_sales_voucher(
     bill_to=None,
     voucher_type=None,
     created_by=None,
+    discount_percent=0,
 ):
 
     account_name = escape(account_name)
@@ -1839,6 +1868,9 @@ def create_sales_voucher(
 
     if line_items:
         normalized_items = [_normalize_line_item(item) for item in line_items]
+        normalized_items = _apply_discount_to_line_items(
+            normalized_items, discount_percent
+        )
         multi_rate_codes = multi_rate_product_codes(normalized_items)
         # Prefer godown already resolved in main (warehouse → Tally). Fallback resolves again.
         godown_for_lines = str(invoice_meta.get("tally_godown_name") or "").strip()
@@ -1875,11 +1907,12 @@ def create_sales_voucher(
                 hsn_tags = _inventory_hsn_tags(item)
                 description_tags = _inventory_description_tags(item)
                 godown = escape(godown_for_lines)
+                discount_tag = _tally_discount_tag(item)
                 inventory_entries += f"""<ALLINVENTORYENTRIES.LIST>
 <STOCKITEMNAME>{stock_name}</STOCKITEMNAME>
 <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
 {description_tags}<RATE>{_tally_rate(item["unit_price"])}</RATE>
-<AMOUNT>{_tally_amount(item["total_price"])}</AMOUNT>
+{discount_tag}<AMOUNT>{_tally_amount(item["total_price"])}</AMOUNT>
 <ACTUALQTY>{_tally_qty(item["quantity"])}</ACTUALQTY>
 <BILLEDQTY>{_tally_qty(item["quantity"])}</BILLEDQTY>
 {hsn_tags}<BATCHALLOCATIONS.LIST>
