@@ -1115,18 +1115,10 @@ def _inventory_description_tags(item):
 
 def _inventory_hsn_tags(item):
 
-    if not TALLY_ENABLE_GST:
-        return ""
-
-    hsn = escape(_item_hsn(item))
-    description = escape(str(item.get("description") or "").strip())
-    tags = f"""<GSTHSNNAME>{hsn}</GSTHSNNAME>
-<GSTHSNINFERAPPLICABILITY>Specify Details Here</GSTHSNINFERAPPLICABILITY>
-"""
-    if description:
-        tags += f"<GSTHSNDESCRIPTION>{description}</GSTHSNDESCRIPTION>\n"
-
-    return tags
+    # Let the transaction inherit HSN/SAC from the stock item master instead of
+    # overriding it here — an explicit override on every line is what Tally's
+    # GSTR-1 exception report flags as "HSN/SAC Details are overridden".
+    return ""
 
 
 def _gst_rate_value(rate):
@@ -1202,13 +1194,11 @@ def _stock_gst_details_xml(bill_to=None):
 
 def _inventory_gst_rate_tags(bill_to=None):
 
-    if not TALLY_ENABLE_GST:
-        return ""
-
-    tags = """<GSTOVRDNTAXABILITY>Taxable</GSTOVRDNTAXABILITY>
-<GSTRATEINFERAPPLICABILITY>Specify Details Here</GSTRATEINFERAPPLICABILITY>
-"""
-    return tags + _stock_gst_rate_blocks(bill_to)
+    # Let the transaction inherit taxability/GST rate/Cess from the stock item
+    # master instead of overriding it here — an explicit override on every line
+    # is what Tally's GSTR-1 exception report flags as "GST Rate Details are
+    # overridden" (and leaves Cess Valuation Type unresolved in the process).
+    return ""
 
 
 def _use_gst_invoice_view():
