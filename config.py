@@ -63,6 +63,21 @@ TRACK_DISPATCH_IN_SALESFORCE = True
 TALLY_DEFAULT_HSN_CODE = "32642000"
 TALLY_UNIT_NAME = "Nos"
 
+# Tally EDU only accepts entries dated the 1st, 2nd or last day of a month, so
+# other dates are moved to the 2nd. Licensed Tally (Silver/Gold) has no such
+# limit: set TALLY_EDU_DATE_RULE=false in that client's environment to keep the
+# real dispatch date. Defaults to true (current EDU behaviour).
+TALLY_EDU_DATE_RULE = os.getenv("TALLY_EDU_DATE_RULE", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+# Reading the voucher number back after a successful import is optional, so
+# those lookups get a short timeout instead of the normal 60s.
+TALLY_LOOKUP_TIMEOUT_SECONDS = 10
+
 TALLY_ENABLE_GST = True
 TALLY_GST_INVOICE_VIEW = True
 TALLY_COMPANY_STATE = "Tamil Nadu"

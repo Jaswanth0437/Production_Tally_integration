@@ -13,12 +13,14 @@ from config import (
     TALLY_COMPANY_NAME,
     TALLY_COMPANY_STATE,
     TALLY_DEFAULT_HSN_CODE,
+    TALLY_EDU_DATE_RULE,
     TALLY_ENABLE_GST,
     TALLY_GST_INVOICE_VIEW,
     TALLY_GODOWN_NAME,
     TALLY_WAREHOUSE_GODOWN_MAP,
     TALLY_IGST_LEDGER,
     TALLY_IGST_RATE,
+    TALLY_LOOKUP_TIMEOUT_SECONDS,
     TALLY_PASSWORD,
     TALLY_ROUND_OFF_LEDGER,
     TALLY_ROUND_OFF_PARENT,
@@ -44,12 +46,16 @@ def _normalize_tally_url(url):
 def _tally_session():
 
     session = requests.Session()
+    # Retry only when the connection itself could not be made. A request that
+    # Tally already received is never re-sent: after a read timeout or a
+    # 502/503/504 it may still be processed, and re-sending a voucher import
+    # could create a duplicate voucher.
     retry = Retry(
         total=2,
         connect=2,
-        read=2,
+        read=0,
+        status=0,
         backoff_factor=0.5,
-        status_forcelist=(502, 503, 504),
         allowed_methods=("POST",),
     )
     adapter = HTTPAdapter(max_retries=retry)
@@ -105,14 +111,14 @@ def _import_requestdesc(report_name):
 </REQUESTDESC>"""
 
 
-def _tally_post(xml):
+def _tally_post(xml, timeout=60):
 
     return _TALLY_HTTP.post(
         _normalize_tally_url(TALLY_URL),
         data=xml,
         headers=_tally_headers(),
         auth=_tally_auth(),
-        timeout=60,
+        timeout=timeout,
     )
 
 
@@ -588,7 +594,11 @@ def _tally_discount_tag(item):
 
 
 def to_tally_voucher_date(date_value=None):
-    """Convert YYYY-MM-DD to YYYYMMDD. Tally EDU allows 1st, 2nd, last day only."""
+    """Convert YYYY-MM-DD to YYYYMMDD.
+
+    Tally EDU allows 1st, 2nd, last day only; that rule is skipped when
+    TALLY_EDU_DATE_RULE is false (licensed Tally keeps the real date).
+    """
     from datetime import datetime
     import calendar
 
@@ -598,6 +608,9 @@ def to_tally_voucher_date(date_value=None):
         dt = datetime.strptime(str(date_value), "%Y-%m-%d")
     else:
         return str(date_value)
+
+    if not TALLY_EDU_DATE_RULE:
+        return dt.strftime("%Y%m%d")
 
     last_day = calendar.monthrange(dt.year, dt.month)[1]
 
@@ -2573,7 +2586,9 @@ def _parse_last_vch_id(response_text):
     return None
 
 
-def _fetch_voucher_by_master_id(vch_id, voucher_type=None):
+def _fetch_voucher_by_master_id(
+    vch_id, voucher_type=None, timeout=TALLY_LOOKUP_TIMEOUT_SECONDS
+):
 
     """Fetch one voucher by MASTERID via filtered collection.
 
@@ -2616,7 +2631,7 @@ def _fetch_voucher_by_master_id(vch_id, voucher_type=None):
 </ENVELOPE>"""
 
     try:
-        response = _tally_post(xml)
+        response = _tally_post(xml, timeout=timeout)
     except requests.RequestException:
         return None
 
@@ -2637,11 +2652,15 @@ def _fetch_voucher_by_master_id(vch_id, voucher_type=None):
 def get_voucher_from_import_response(
     voucher_response,
     voucher_type=None,
-    max_attempts=8,
+    max_attempts=1,
     retry_delay_seconds=0.5,
 ):
 
-    """Read VOUCHERNUMBER for the voucher just created using Tally LASTVCHID."""
+    """Read VOUCHERNUMBER for the voucher just created using Tally LASTVCHID.
+
+    One quick attempt by default: the voucher is already in Tally, so the
+    number is a nice-to-have and must never hold up the response.
+    """
 
     import time
 
@@ -2694,6 +2713,7 @@ def get_voucher_from_daybook(
     reference_name=None,
     max_attempts=6,
     retry_delay_seconds=1.5,
+    timeout=60,
 ):
 
     """Read VOUCHERNUMBER and VOUCHERTYPENAME from Tally Day Book."""
@@ -2738,7 +2758,7 @@ def get_voucher_from_daybook(
         else:
             time.sleep(0.5)
 
-        response = _tally_post(xml)
+        response = _tally_post(xml, timeout=timeout)
         matches = []
 
         for voucher in _parse_daybook_vouchers(response.text):
@@ -2846,33 +2866,38 @@ def get_voucher_after_create(
     reference_name=None,
 ):
 
-    # Prefer direct MASTERID collection (fast). Object-by-MasterId is unreliable here.
-    info = get_voucher_from_import_response(
-        voucher_response,
-        voucher_type=voucher_type,
-    )
-    if info and info.get("number"):
-        return info
+    """Best-effort voucher number lookup. Never raises, never blocks for long.
 
-    master_id = _parse_last_vch_id(voucher_response)
-    if master_id:
-        info = get_voucher_by_master_id(
-            voucher_date,
-            master_id,
+    The voucher is already created when this runs. Direct MASTERID collection
+    is tried once (short timeout). The Day Book export is far heavier and is
+    only tried, once, when Tally gave no LASTVCHID to look up.
+    """
+
+    try:
+        info = get_voucher_from_import_response(
+            voucher_response,
             voucher_type=voucher_type,
         )
         if info and info.get("number"):
             return info
 
-    # Fallback: Day Book match on bill ref (DN-xxxx) since narration is only "Created By".
-    info = get_voucher_from_daybook(
-        voucher_date,
-        reference_id,
-        voucher_type=voucher_type,
-        reference_name=reference_name,
-    )
-    if info and info.get("number"):
-        return info
+        if _parse_last_vch_id(voucher_response):
+            return None
+
+        # No LASTVCHID in the response: Day Book match on bill ref (DN-xxxx)
+        # since narration is only "Created By". Single attempt, no waiting.
+        info = get_voucher_from_daybook(
+            voucher_date,
+            reference_id,
+            voucher_type=voucher_type,
+            reference_name=reference_name,
+            max_attempts=1,
+            timeout=TALLY_LOOKUP_TIMEOUT_SECONDS,
+        )
+        if info and info.get("number"):
+            return info
+    except (requests.RequestException, ET.ParseError):
+        pass
 
     return None
 

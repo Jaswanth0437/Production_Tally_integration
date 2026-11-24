@@ -1,5 +1,7 @@
+import threading
 from typing import Optional
 
+import requests
 from fastapi import Body, FastAPI, Header, Query
 from pydantic import BaseModel, Field
 
@@ -75,6 +77,36 @@ class ProductSyncRequest(BaseModel):
         examples=["a0Xfw000000XXXX"],
         min_length=1,
     )
+
+
+_IN_PROGRESS = set()
+_IN_PROGRESS_LOCK = threading.Lock()
+
+
+def _begin_request(key):
+
+    """Claim a record so a second click/request for it cannot run at the same time."""
+
+    with _IN_PROGRESS_LOCK:
+        if key in _IN_PROGRESS:
+            return False
+        _IN_PROGRESS.add(key)
+        return True
+
+
+def _end_request(key):
+
+    with _IN_PROGRESS_LOCK:
+        _IN_PROGRESS.discard(key)
+
+
+_ALREADY_RUNNING = {
+    "success": False,
+    "message": (
+        "An invoice for this record is already being created in Tally. "
+        "Wait for it to finish and do not click again."
+    ),
+}
 
 
 def _resolve_created_by(*values):
@@ -207,27 +239,55 @@ def _create_tally_billing(
         "tally_godown_name": godown_map["godown_name"],
     }
 
-    voucher_response = create_sales_voucher(
-        account_name,
-        amount,
-        reference_name,
-        reference_id,
-        voucher_date,
-        line_items=line_items,
-        source_label=source_label,
-        bill_reference=reference_name,
-        invoice_meta=invoice_meta,
-        bill_to=bill_to,
-        voucher_type=voucher_type,
-        created_by=created_by,
-        discount_percent=discount_percent,
-    )
+    try:
+        voucher_response = create_sales_voucher(
+            account_name,
+            amount,
+            reference_name,
+            reference_id,
+            voucher_date,
+            line_items=line_items,
+            source_label=source_label,
+            bill_reference=reference_name,
+            invoice_meta=invoice_meta,
+            bill_to=bill_to,
+            voucher_type=voucher_type,
+            created_by=created_by,
+            discount_percent=discount_percent,
+        )
+    except requests.RequestException as exc:
+        # Tally may have received and even saved the voucher before the reply
+        # was lost, so the outcome is unknown. Never invite a blind retry.
+        print(f"Voucher import got no answer from Tally: {exc}")
+        return {
+            "success": False,
+            "message": (
+                f"Tally did not answer the voucher import for {reference_name} "
+                f"({type(exc).__name__}). The voucher may or may not have been "
+                f"created. Check Tally's Day Book for {reference_name} before "
+                "retrying, to avoid a duplicate."
+            ),
+        }
 
     print("\nVoucher Response")
     print(voucher_response)
 
     if "<CREATED>1</CREATED>" in voucher_response:
         salesforce_updated = False
+        salesforce_error = None
+
+        # The voucher now exists in Tally. Mark it sent in Salesforce right away,
+        # before the optional voucher-number lookup, so a slow or failed lookup
+        # can never leave the record looking unsent (which invites a duplicate).
+        if update_callback:
+            try:
+                update_callback(voucher_number=None, voucher_type=voucher_type)
+                salesforce_updated = True
+                print("Salesforce Updated : Sent_To_Tally__c = True")
+            except Exception as exc:
+                salesforce_error = str(exc)
+                print(f"Salesforce update failed after Tally create: {exc}")
+
         # Use the real Tally voucher type name (last segment of Group/Ledger/Type).
         tally_lookup_type = (
             parse_voucher_type_option(voucher_type).get("voucher_type")
@@ -255,13 +315,19 @@ def _create_tally_billing(
                 f"(date={voucher_date}, ref={reference_id})"
             )
 
-        if update_callback:
-            update_callback(
-                voucher_number=voucher_number,
-                voucher_type=tally_voucher_type,
-            )
-            salesforce_updated = True
-            print("Salesforce Updated : Sent_To_Tally__c = True")
+        # Second, best-effort update to store the voucher number once known.
+        if update_callback and voucher_number:
+            try:
+                update_callback(
+                    voucher_number=voucher_number,
+                    voucher_type=tally_voucher_type,
+                )
+                salesforce_updated = True
+                salesforce_error = None
+                print("Salesforce Updated : Tally voucher number saved")
+            except Exception as exc:
+                salesforce_error = salesforce_error or str(exc)
+                print(f"Salesforce voucher number update failed: {exc}")
 
         vch_type_label = str(tally_voucher_type or "").strip() or "Unknown"
 
@@ -274,6 +340,13 @@ def _create_tally_billing(
             success_message = (
                 f"Voucher Created Successfully. Type: {vch_type_label}. "
                 "Tally voucher number was not found from Tally yet."
+            )
+
+        if update_callback and not salesforce_updated:
+            success_message = (
+                f"{success_message} WARNING: the voucher exists in Tally but "
+                f"Salesforce was not updated ({salesforce_error}). "
+                "Do not create it again."
             )
 
         return {
@@ -513,7 +586,7 @@ def create_voucher(opportunity_id: str):
             line_items=line_items,
             source_label="Salesforce Opportunity",
             invoice_meta=None,
-            update_callback=lambda: update_opportunity(opportunity_id),
+            update_callback=lambda **_: update_opportunity(opportunity_id),
         )
     except Exception as e:
         return {
@@ -535,6 +608,11 @@ def create_dispatch_invoice(
     ),
     payload: DispatchInvoiceRequest | None = Body(default=None),
 ):
+
+    # One invoice run per dispatch at a time: a double click while the first is
+    # still talking to Tally would otherwise pass the "already sent" check twice.
+    if not _begin_request(dispatch_id):
+        return dict(_ALREADY_RUNNING)
 
     try:
         resolved_created_by = _resolve_created_by(
@@ -644,3 +722,5 @@ def create_dispatch_invoice(
             "success": False,
             "message": str(e)
         }
+    finally:
+        _end_request(dispatch_id)
