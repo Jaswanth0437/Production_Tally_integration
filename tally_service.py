@@ -2179,8 +2179,35 @@ def create_sales_voucher(
             ship_city or str(bill_to.get("city") or "").strip()
         )
 
+        # Consignee address (Address1 in Tally) from the Opportunity's account:
+        # the shipping address, or the billing address when none is set. One
+        # joined line, the same shape Tally keeps for manually entered vouchers.
+        eway_consignee_address = escape(
+            ", ".join(ship_address_lines or _split_address_lines(bill_to))
+        )
+        eway_consignee_address_xml = (
+            '<CONSIGNEEADDRESS.LIST TYPE="String">\n'
+            f"<CONSIGNEEADDRESS>{eway_consignee_address}</CONSIGNEEADDRESS>\n"
+            "</CONSIGNEEADDRESS.LIST>\n"
+            if eway_consignee_address
+            else ""
+        )
+
+        # Part B: Mode = Road, plus the dispatch vehicle number when there is one.
+        # (E-way bill vehicle numbers have no spaces or hyphens.)
+        eway_vehicle_number = escape(
+            re.sub(r"[\s-]+", "", str(invoice_meta.get("vehicle_number") or "")).upper()
+        )
+        eway_transport_xml = "<TRANSPORTDETAILS.LIST>\n<TRANSPORTMODE>1 - Road</TRANSPORTMODE>\n"
+        if eway_vehicle_number:
+            eway_transport_xml += (
+                f"<VEHICLENUMBER>{eway_vehicle_number}</VEHICLENUMBER>\n"
+                "<VEHICLETYPE>R - Regular</VEHICLETYPE>\n"
+            )
+        eway_transport_xml += "</TRANSPORTDETAILS.LIST>\n"
+
         eway_bill_tags = """<EWAYBILLDETAILS.LIST>
-<SUBTYPE>Supply</SUBTYPE>
+{eway_consignee_address_xml}<SUBTYPE>Supply</SUBTYPE>
 <DOCUMENTTYPE>Tax Invoice</DOCUMENTTYPE>
 <CONSIGNORNAME>{consignor_name}</CONSIGNORNAME>
 <CONSIGNORGSTIN>{consignor_gstin}</CONSIGNORGSTIN>
@@ -2193,8 +2220,12 @@ def create_sales_voucher(
 <CONSIGNEEPLACE>{eway_consignee_place}</CONSIGNEEPLACE>
 <CONSIGNEEPINCODE>{eway_consignee_pincode}</CONSIGNEEPINCODE>
 <CONSIGNEESTATENAME>{eway_consignee_state}</CONSIGNEESTATENAME>
-</EWAYBILLDETAILS.LIST>
+<SHIPPEDFROMSTATE>{consignor_state}</SHIPPEDFROMSTATE>
+<SHIPPEDTOSTATE>{eway_consignee_state}</SHIPPEDTOSTATE>
+{eway_transport_xml}</EWAYBILLDETAILS.LIST>
 """.format(
+            eway_consignee_address_xml=eway_consignee_address_xml,
+            eway_transport_xml=eway_transport_xml,
             consignor_name=consignor_name,
             consignor_gstin=consignor_gstin,
             consignor_pincode=consignor_pincode,
