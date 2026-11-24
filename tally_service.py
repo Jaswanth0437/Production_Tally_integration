@@ -1103,6 +1103,11 @@ def match_line_items_to_tally_stock(line_items):
 
 def _inventory_description_tags(item):
 
+    
+    # Description line intentionally not sent to Tally: invoice should show
+    # only the stock item name. Remove this return to restore descriptions.
+    return ""
+
     description = escape(str(item.get("description") or "").strip())
     if not description:
         return ""
